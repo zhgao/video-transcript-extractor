@@ -1,0 +1,7 @@
+youtube-transcript-api
+flask
+yt-dlp
+openai-whisper
+torch
+torchaudio
+requests
