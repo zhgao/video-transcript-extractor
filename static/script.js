@@ -10,7 +10,7 @@ async function summarizeTranscript() {
     const urlInput = document.getElementById('videoUrl');
     const url = urlInput.value.trim();
 
-    const summaryBtn = document.getElementById('summaryBtn');
+    const summaryBtn = document.getElementById('summarizeBtn');
     const summaryDiv = document.getElementById('summary');
     const summaryContent = document.getElementById('summaryContent');
 
@@ -275,7 +275,7 @@ async function summarizeTranscript() {
     const urlInput = document.getElementById('videoUrl');
     const url = urlInput.value.trim();
 
-    const summaryBtn = document.getElementById('summaryBtn');
+    const summaryBtn = document.getElementById('summarizeBtn');
     const summaryDiv = document.getElementById('summary');
     const summaryContent = document.getElementById('summaryContent');
 

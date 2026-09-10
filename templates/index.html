@@ -1,95 +1,96 @@
 <!DOCTYPE html>
 <html lang="en">
+
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>YouTube Transcript Extractor</title>
     <link rel="stylesheet" href="{{ url_for('static', filename='style.css') }}?v=10">
 </head>
+
 <body>
     <div class="container">
         <h1>🎥 Video Transcript Extractor</h1>
         <p class="subtitle">Paste a video URL to extract the transcript (YouTube, TikTok, and more)</p>
-        
+
         <div class="tabs">
             <button class="tab-btn active" onclick="switchTab('extract')">Extract Transcript</button>
             <button class="tab-btn" onclick="switchTab('history')">History</button>
             <button class="tab-btn" onclick="switchTab('howto')">How It Works</button>
         </div>
-        
+
         <div id="extractTab" class="tab-content active">
-        
-        <div class="tech-badges">
-            <span class="badge">🤖 OpenAI Whisper</span>
-            <span class="badge">🦙 Ollama AI</span>
-            <span class="badge">⚡ yt-dlp</span>
-        </div>
-        
-        <div class="input-section">
-            <input 
-                type="text" 
-                id="videoUrl" 
-                placeholder="https://www.youtube.com/watch?v=... or https://www.tiktok.com/@user/video/..." 
-                autocomplete="off"
-            >
-            <button id="extractBtn" onclick="extractTranscript()">Extract Transcript</button>
-        </div>
-        
-        <div id="progress-visualizer" class="progress-visualizer hidden" style="display: none;">
-            <div class="progress-step" id="step-api">
-                <div class="step-icon">⚡</div>
-                <div class="step-label">Fast Path (API)</div>
+
+            <div class="tech-badges">
+                <span class="badge">🤖 OpenAI Whisper</span>
+                <span class="badge">🦙 Ollama AI</span>
+                <span class="badge">⚡ yt-dlp</span>
             </div>
-            <div class="progress-line"></div>
-            <div class="progress-step" id="step-ytdlp">
-                <div class="step-icon">🐢</div>
-                <div class="step-label">Medium Path</div>
+
+            <div class="input-section">
+                <input type="text" id="videoUrl"
+                    placeholder="https://www.youtube.com/watch?v=... or https://www.tiktok.com/@user/video/..."
+                    autocomplete="off">
+                <button id="extractBtn" onclick="extractTranscript()">Extract Transcript</button>
             </div>
-            <div class="progress-line"></div>
-            <div class="progress-step" id="step-whisper">
-                <div class="step-icon">🤖</div>
-                <div class="step-label">AI Path (Whisper)</div>
-            </div>
-        </div>
-        
 
-
-        <div id="loading" class="loading hidden" style="display: none;">
-            <div class="spinner"></div>
-            <p>Extracting transcript...</p>
-        </div>
-
-        <div id="error" class="error hidden" style="display: none;"></div>
-
-        <div id="result" class="result hidden" style="display: none;">
-            <div class="result-header">
-                <h2>Transcript</h2>
-                <div>
-                    <button onclick="summarizeTranscript()" class="summary-btn" id="summaryBtn">✨ Summarize</button>
-                    <button onclick="copyTranscript()" class="copy-btn">📋 Copy</button>
+            <div id="progress-visualizer" class="progress-visualizer hidden" style="display: none;">
+                <div class="progress-step" id="step-api">
+                    <div class="step-icon">⚡</div>
+                    <div class="step-label">Fast Path (API)</div>
+                </div>
+                <div class="progress-line"></div>
+                <div class="progress-step" id="step-ytdlp">
+                    <div class="step-icon">🐢</div>
+                    <div class="step-label">Medium Path</div>
+                </div>
+                <div class="progress-line"></div>
+                <div class="progress-step" id="step-whisper">
+                    <div class="step-icon">🤖</div>
+                    <div class="step-label">AI Path (Whisper)</div>
                 </div>
             </div>
-            <div id="summary" class="summary hidden" style="display: none;">
-                <h3>📝 Summary</h3>
-                <div id="summaryContent"></div>
-            </div>
-            <div id="transcript" class="transcript"></div>
-        </div>
-        
-    </div>
-        
-    <div id="historyTab" class="tab-content" style="display: none;">
-        <h2>📜 History</h2>
-        <div id="historyList" class="history-list">
-            <!-- History items will be populated here -->
-             <div class="loading-spinner">Loading history...</div>
-        </div>
-    </div>
 
-    <div id="howtoTab" class="tab-content">
+
+
+            <div id="loading" class="loading hidden" style="display: none;">
+                <div class="spinner"></div>
+                <p>Extracting transcript...</p>
+            </div>
+
+            <div id="error" class="error hidden" style="display: none;"></div>
+
+            <div id="result" class="result hidden" style="display: none;">
+                <div class="result-header">
+                    <h2>Transcript</h2>
+                    <div class="actions">
+                        <button onclick="summarizeTranscript()" id="summarizeBtn" class="secondary-btn">
+                            ✨ Generate Summary
+                        </button>
+                        <button onclick="copyTranscript()" class="copy-btn">📋 Copy</button>
+                    </div>
+                </div>
+                <div id="summary" class="summary hidden" style="display: none;">
+                    <h3>📝 Summary</h3>
+                    <div id="summaryContent"></div>
+                </div>
+                <div id="transcript" class="transcript"></div>
+            </div>
+
+        </div>
+
+        <div id="historyTab" class="tab-content" style="display: none;">
+            <h2>📜 History</h2>
+            <div id="historyList" class="history-list">
+                <!-- History items will be populated here -->
+                <div class="loading-spinner">Loading history...</div>
+            </div>
+        </div>
+
+        <div id="howtoTab" class="tab-content">
             <div class="howto-content">
                 <h2>🚀 How It Works</h2>
-                
+
                 <div class="feature-section">
                     <h3>📊 Smart 3-Tier Extraction System</h3>
                     <div class="flow-diagram">
@@ -118,51 +119,58 @@
                         </div>
                     </div>
                 </div>
-                
+
                 <div class="feature-section">
                     <h3>🤖 AI Technologies</h3>
                     <div class="tech-grid">
                         <div class="tech-card">
                             <h4>🎙️ OpenAI Whisper</h4>
-                            <p>State-of-the-art speech recognition AI that transcribes audio to text with high accuracy. Works on any video with speech, even without captions.</p>
+                            <p>State-of-the-art speech recognition AI that transcribes audio to text with high accuracy.
+                                Works on any video with speech, even without captions.</p>
                         </div>
                         <div class="tech-card">
                             <h4>🦙 Llama 3.2 (Ollama)</h4>
-                            <p>Advanced language model running locally on your machine. Generates intelligent summaries of transcripts in seconds.</p>
+                            <p>Advanced language model running locally on your machine. Generates intelligent summaries
+                                of transcripts in seconds.</p>
                         </div>
                         <div class="tech-card">
                             <h4>⚡ yt-dlp</h4>
-                            <p>Powerful video downloader supporting 1000+ platforms. Extracts audio and metadata from videos efficiently.</p>
+                            <p>Powerful video downloader supporting 1000+ platforms. Extracts audio and metadata from
+                                videos efficiently.</p>
                         </div>
                     </div>
                 </div>
-                
+
                 <div class="feature-section">
                     <h3>✨ Key Features</h3>
                     <ul class="feature-list">
                         <li><strong>Multi-Platform:</strong> YouTube, TikTok, Instagram, Twitter, and 1000+ sites</li>
-                        <li><strong>Automatic Fallback:</strong> Tries fastest method first, falls back to AI if needed</li>
+                        <li><strong>Automatic Fallback:</strong> Tries fastest method first, falls back to AI if needed
+                        </li>
                         <li><strong>Real-Time Progress:</strong> See transcription progress as it happens</li>
                         <li><strong>AI Summarization:</strong> Get concise summaries with one click</li>
                         <li><strong>Beautiful Formatting:</strong> Auto-formatted paragraphs for easy reading</li>
                         <li><strong>Privacy First:</strong> All AI processing happens locally on your machine</li>
                     </ul>
                 </div>
-                
+
                 <div class="feature-section">
                     <h3>🎯 Usage Tips</h3>
                     <div class="tips-grid">
                         <div class="tip-card">
                             <span class="tip-icon">💡</span>
-                            <p><strong>For fastest results:</strong> Use videos that already have captions (most YouTube videos)</p>
+                            <p><strong>For fastest results:</strong> Use videos that already have captions (most YouTube
+                                videos)</p>
                         </div>
                         <div class="tip-card">
                             <span class="tip-icon">⏱️</span>
-                            <p><strong>AI transcription:</strong> Takes 1-5 minutes depending on video length. Be patient!</p>
+                            <p><strong>AI transcription:</strong> Takes 1-5 minutes depending on video length. Be
+                                patient!</p>
                         </div>
                         <div class="tip-card">
                             <span class="tip-icon">📋</span>
-                            <p><strong>Copy transcript:</strong> Use the copy button to paste into notes, documents, or AI tools</p>
+                            <p><strong>Copy transcript:</strong> Use the copy button to paste into notes, documents, or
+                                AI tools</p>
                         </div>
                         <div class="tip-card">
                             <span class="tip-icon">✨</span>
@@ -170,7 +178,7 @@
                         </div>
                     </div>
                 </div>
-                
+
                 <div class="feature-section">
                     <h3>⚙️ Technical Details</h3>
                     <table class="tech-table">
@@ -198,9 +206,9 @@
                 </div>
             </div>
         </div>
-        
+
     </div>
-    
+
     <footer class="footer">
         <p>Powered by cutting-edge AI technology</p>
         <div class="tech-stack">
@@ -214,4 +222,5 @@
 
     <script src="{{ url_for('static', filename='script.js') }}?v=10"></script>
 </body>
+
 </html>

@@ -14,7 +14,11 @@ import json
 import time
 import sqlite3
 import datetime
+import concurrent.futures
 from urllib.parse import urlparse, parse_qs
+
+# --- Configuration ---
+ENABLE_OLLAMA = True  # Re-enabled for Service Mode
 
 
 def is_youtube_url(url):
@@ -103,6 +107,11 @@ app = Flask(__name__)
 # Load Whisper model (lazy loading)
 whisper_model = None
 
+YOUTUBE_API_TIMEOUT_SECONDS = 8
+NETWORK_TIMEOUT_SECONDS = 15
+COOKIE_FILE = 'cookies.txt'
+BROWSER_COOKIE_SOURCE = ('chrome',)
+
 def get_whisper_model():
     global whisper_model
     if whisper_model is None:
@@ -116,6 +125,40 @@ def get_event(status, **kwargs):
     data = {'status': status}
     data.update(kwargs)
     return f"data: {json.dumps(data)}\n\n"
+
+def fetch_youtube_transcript_with_timeout(video_id):
+    """Fetch transcript captions without letting the request block the whole stream."""
+    executor = concurrent.futures.ThreadPoolExecutor(max_workers=1)
+    try:
+        future = executor.submit(
+            lambda: YouTubeTranscriptApi().fetch(video_id, languages=['en'])
+        )
+        return future.result(timeout=YOUTUBE_API_TIMEOUT_SECONDS)
+    finally:
+        executor.shutdown(wait=False, cancel_futures=True)
+
+def ytdlp_extract_info(video_url, base_opts, download=False):
+    """Try yt-dlp with exported cookies, then retry with browser cookies if needed."""
+    cookie_attempts = []
+    if os.path.exists(COOKIE_FILE):
+        cookie_attempts.append(('cookies.txt', {'cookiefile': COOKIE_FILE}))
+    cookie_attempts.append(('Chrome browser cookies', {'cookiesfrombrowser': BROWSER_COOKIE_SOURCE}))
+
+    last_error = None
+    for label, cookie_opts in cookie_attempts:
+        try:
+            ydl_opts = dict(base_opts)
+            ydl_opts.update(cookie_opts)
+            print(f"Trying yt-dlp with {label}...")
+            with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+                return ydl.extract_info(video_url, download=download)
+        except Exception as e:
+            last_error = e
+            print(f"yt-dlp with {label} failed: {e}")
+
+    if last_error:
+        raise last_error
+    raise RuntimeError("yt-dlp failed before making an extraction attempt")
 
 def stream_extraction(video_url, force_whisper=False):
     """
@@ -140,8 +183,7 @@ def stream_extraction(video_url, force_whisper=False):
         video_id = extract_video_id(video_url)
         if video_id and len(video_id) == 11:
             try:
-                api = YouTubeTranscriptApi()
-                transcript_data = api.fetch(video_id, languages=['en'])
+                transcript_data = fetch_youtube_transcript_with_timeout(video_id)
                 full_transcript = ' '.join([snippet.text for snippet in transcript_data.snippets])
                 if video_id:
                    save_video_to_db(video_id, video_url, full_transcript)
@@ -163,42 +205,40 @@ def stream_extraction(video_url, force_whisper=False):
                 'subtitleslangs': ['en'],
                 'quiet': True,
                 'no_warnings': True,
-                'cookiesfrombrowser': ('chrome',)
+                'socket_timeout': NETWORK_TIMEOUT_SECONDS,
             }
+            info = ytdlp_extract_info(video_url, ydl_opts, download=False)
+                
+            subs = None
+            if 'subtitles' in info and 'en' in info['subtitles']:
+                subs = info['subtitles']['en']
+            elif 'automatic_captions' in info and 'en' in info['automatic_captions']:
+                subs = info['automatic_captions']['en']
             
-            with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-                info = ydl.extract_info(video_url, download=False)
+            if subs:
+                # Parse subtitles logic
+                json3_url = None
+                for sub in subs:
+                    if sub.get('ext') == 'json3':
+                        json3_url = sub.get('url')
+                        break
                 
-                subs = None
-                if 'subtitles' in info and 'en' in info['subtitles']:
-                    subs = info['subtitles']['en']
-                elif 'automatic_captions' in info and 'en' in info['automatic_captions']:
-                    subs = info['automatic_captions']['en']
-                
-                if subs:
-                    # Parse subtitles logic
-                    json3_url = None
-                    for sub in subs:
-                        if sub.get('ext') == 'json3':
-                            json3_url = sub.get('url')
-                            break
-                    
-                    if json3_url:
-                        import requests
-                        import json
-                        response = requests.get(json3_url)
-                        data = response.json()
-                        transcript_parts = []
-                        for event in data.get('events', []):
-                            if 'segs' in event:
-                                for seg in event['segs']:
-                                    if 'utf8' in seg:
-                                        transcript_parts.append(seg['utf8'])
-                        full_transcript = ' '.join(transcript_parts).replace('\n', ' ')
-                        if video_id:
-                             save_video_to_db(video_id, video_url, full_transcript)
-                        yield get_event('complete', transcript=full_transcript)
-                        return
+                if json3_url:
+                    import requests
+                    import json
+                    response = requests.get(json3_url, timeout=NETWORK_TIMEOUT_SECONDS)
+                    data = response.json()
+                    transcript_parts = []
+                    for event in data.get('events', []):
+                        if 'segs' in event:
+                            for seg in event['segs']:
+                                if 'utf8' in seg:
+                                    transcript_parts.append(seg['utf8'])
+                    full_transcript = ' '.join(transcript_parts).replace('\n', ' ')
+                    if video_id:
+                         save_video_to_db(video_id, video_url, full_transcript)
+                    yield get_event('complete', transcript=full_transcript)
+                    return
         except Exception as e:
             print(f"yt-dlp error: {str(e)}")
             # Continue to next step
@@ -264,13 +304,11 @@ def stream_whisper_transcription(video_url):
                 }],
                 'quiet': True,
                 'no_warnings': True,
-                'cookiesfrombrowser': ('chrome',)
+                'socket_timeout': NETWORK_TIMEOUT_SECONDS,
             }
-            
-            with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-                info = ydl.extract_info(video_url, download=True)
-                duration = info.get('duration', 0)
-                duration_str = f"{int(duration // 60)}:{int(duration % 60):02d}" if duration else "unknown"
+            info = ytdlp_extract_info(video_url, ydl_opts, download=True)
+            duration = info.get('duration', 0)
+            duration_str = f"{int(duration // 60)}:{int(duration % 60):02d}" if duration else "unknown"
             
             yield f"data: {json.dumps({'status': 'processing', 'message': f'Step 3/4: Processing audio (duration: {duration_str})...'})}\n\n"
             

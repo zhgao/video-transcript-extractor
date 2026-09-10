@@ -44,3 +44,7 @@ tmp/
 build/
 dist/
 *.egg-info/
+
+# Marketing / business assets (not part of the open-source project)
+generate_xianyu_copy.py
+cover_image.png

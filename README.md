@@ -43,7 +43,8 @@ brew install ollama
 ### 2. Clone and Setup
 
 ```bash
-cd youtube-script-summarize
+git clone https://github.com/zhgao/video-transcript-extractor.git
+cd video-transcript-extractor
 python3 -m venv venv
 source venv/bin/activate
 pip install -r requirements.txt
@@ -115,7 +116,7 @@ When no captions exist:
 ## 📁 Project Structure
 
 ```
-youtube-script-summarize/
+video-transcript-extractor/
 ├── app.py                 # Flask backend
 ├── requirements.txt       # Python dependencies
 ├── cookies.txt           # YouTube cookies (optional)
