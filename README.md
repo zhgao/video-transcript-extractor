@@ -1,5 +1,7 @@
 # 🎥 AI Video Transcript Extractor
 
+**English** | **[中文](README.zh-CN.md)**
+
 A powerful web application that extracts and summarizes video transcripts using cutting-edge AI technology.
 
 ## ✨ Features
