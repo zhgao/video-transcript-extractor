@@ -3,7 +3,8 @@
 YouTube Transcript Extractor - Web Interface
 """
 
-from flask import Flask, render_template, request, jsonify, Response, stream_with_context
+from flask import Flask, render_template, request, jsonify, Response, stream_with_context, session, redirect, url_for
+from werkzeug.middleware.proxy_fix import ProxyFix
 from youtube_transcript_api import YouTubeTranscriptApi
 import yt_dlp
 import whisper
@@ -15,10 +16,55 @@ import time
 import sqlite3
 import datetime
 import concurrent.futures
+import hmac
+import ipaddress
+import secrets
+import socket
+import threading
 from urllib.parse import urlparse, parse_qs
 
 # --- Configuration ---
 ENABLE_OLLAMA = True  # Re-enabled for Service Mode
+
+# --- Public deployment settings ---
+# Everything below is optional. With no env vars set the app behaves exactly
+# like the original local tool: no auth, bound to loopback, single user.
+ACCESS_PASSWORD = os.environ.get('ACCESS_PASSWORD', '').strip()
+PUBLIC_MODE = bool(ACCESS_PASSWORD)
+BIND_HOST = os.environ.get('BIND_HOST', '127.0.0.1')
+BIND_PORT = int(os.environ.get('PORT', '8080'))
+MAX_CONCURRENT_TRANSCRIPTIONS = int(os.environ.get('MAX_CONCURRENT_TRANSCRIPTIONS', '2'))
+RATE_LIMIT_REQUESTS = int(os.environ.get('RATE_LIMIT_REQUESTS', '20'))
+RATE_LIMIT_WINDOW_SECONDS = int(os.environ.get('RATE_LIMIT_WINDOW_SECONDS', '600'))
+MAX_REQUEST_BYTES = int(os.environ.get('MAX_REQUEST_BYTES', str(2 * 1024 * 1024)))
+
+# Refuse to fetch anything that is not a public HTTP(S) endpoint. This closes
+# the SSRF hole where a caller could point yt-dlp at file://, the loopback
+# interface, or a device on the local network.
+ALLOWED_URL_SCHEMES = ('http', 'https')
+BLOCKED_HOSTNAMES = {'localhost', 'localhost.localdomain', 'metadata.google.internal'}
+
+
+def _load_or_create_secret_key():
+    """Persist the session signing key so logins survive a restart."""
+    env_key = os.environ.get('SECRET_KEY', '').strip()
+    if env_key:
+        return env_key
+    path = os.path.join(os.path.dirname(os.path.abspath(__file__)), '.secret_key')
+    try:
+        if os.path.exists(path):
+            with open(path, 'r', encoding='utf-8') as fh:
+                existing = fh.read().strip()
+            if existing:
+                return existing
+        generated = secrets.token_hex(32)
+        with open(path, 'w', encoding='utf-8') as fh:
+            fh.write(generated)
+        os.chmod(path, 0o600)
+        return generated
+    except Exception as e:
+        print(f"Secret key persistence failed, using ephemeral key: {e}")
+        return secrets.token_hex(32)
 
 
 def is_youtube_url(url):
@@ -48,7 +94,14 @@ def extract_video_id(url):
             
     return None
 
-DATA_DB = 'transcripts.db'
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+DATA_DB = os.path.join(BASE_DIR, 'transcripts.db')
+
+# A visitor only ever sees their own extraction history. The transcript cache
+# itself stays keyed by video_id (the videos are public), but the *list* of
+# what someone looked up is private, so it lives in its own table.
+LOCAL_SCOPE = 'local'
+
 
 def init_db():
     start_time = time.time()
@@ -66,10 +119,52 @@ def init_db():
                     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
                 )
             ''')
+            c.execute('''
+                CREATE TABLE IF NOT EXISTS user_history (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    session_id TEXT NOT NULL,
+                    video_id TEXT NOT NULL,
+                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                    UNIQUE(session_id, video_id)
+                )
+            ''')
+            c.execute('CREATE INDEX IF NOT EXISTS idx_history_session ON user_history(session_id)')
+            # Backfill: everything extracted before this change belongs to the
+            # single local user.
+            c.execute('''
+                INSERT OR IGNORE INTO user_history (session_id, video_id, created_at)
+                SELECT ?, video_id, created_at FROM videos
+            ''', (LOCAL_SCOPE,))
             conn.commit()
     except Exception as e:
         print(f"DB Init Error: {e}")
     print(f"DB Init took {time.time() - start_time:.4f}s")
+
+
+def get_scope_id():
+    """Identify the current visitor so history can be scoped per person."""
+    if not PUBLIC_MODE:
+        return LOCAL_SCOPE
+    scope = session.get('scope_id')
+    if not scope:
+        scope = secrets.token_hex(8)
+        session['scope_id'] = scope
+    return scope
+
+
+def record_history(scope_id, video_id):
+    try:
+        with sqlite3.connect(DATA_DB) as conn:
+            c = conn.cursor()
+            c.execute('''
+                INSERT INTO user_history (session_id, video_id)
+                VALUES (?, ?)
+                ON CONFLICT(session_id, video_id) DO UPDATE SET
+                    created_at = CURRENT_TIMESTAMP
+            ''', (scope_id, video_id))
+            conn.commit()
+    except Exception as e:
+        print(f"History record error: {e}")
 
 # Initialize DB on startup
 init_db()
@@ -85,7 +180,7 @@ def get_video_from_db(video_id):
         print(f"DB Get Error: {e}")
         return None
 
-def save_video_to_db(video_id, url, transcript, title=None, summary=None):
+def save_video_to_db(video_id, url, transcript, title=None, summary=None, scope_id=None):
     try:
         with sqlite3.connect(DATA_DB) as conn:
             c = conn.cursor()
@@ -101,16 +196,126 @@ def save_video_to_db(video_id, url, transcript, title=None, summary=None):
             print(f"Saved to DB: {video_id}")
     except Exception as e:
         print(f"DB Save Error: {e}")
+    if scope_id:
+        record_history(scope_id, video_id)
 
 app = Flask(__name__)
+app.secret_key = _load_or_create_secret_key()
+app.config['MAX_CONTENT_LENGTH'] = MAX_REQUEST_BYTES
+app.config['SESSION_COOKIE_HTTPONLY'] = True
+app.config['SESSION_COOKIE_SAMESITE'] = 'Lax'
+app.config['PERMANENT_SESSION_LIFETIME'] = datetime.timedelta(days=7)
+_secure_cookie_default = 'true' if PUBLIC_MODE else 'false'
+app.config['SESSION_COOKIE_SECURE'] = os.environ.get(
+    'SESSION_COOKIE_SECURE', _secure_cookie_default
+).lower() in ('1', 'true', 'yes')
+
+if PUBLIC_MODE:
+    # The tunnel terminates TLS and forwards X-Forwarded-* headers, so trust
+    # exactly one hop. Without this every visitor looks like 127.0.0.1.
+    app.wsgi_app = ProxyFix(app.wsgi_app, x_for=1, x_proto=1, x_host=1)
 
 # Load Whisper model (lazy loading)
 whisper_model = None
 
 YOUTUBE_API_TIMEOUT_SECONDS = 8
 NETWORK_TIMEOUT_SECONDS = 15
-COOKIE_FILE = 'cookies.txt'
+COOKIE_FILE = os.path.join(BASE_DIR, 'cookies.txt')
 BROWSER_COOKIE_SOURCE = ('chrome',)
+
+# Cap concurrent transcriptions. Whisper on CPU is slow and memory-hungry;
+# without this a handful of simultaneous visitors can take the machine down.
+_transcription_slots = threading.Semaphore(MAX_CONCURRENT_TRANSCRIPTIONS)
+
+# --- Abuse protection -------------------------------------------------------
+_rate_lock = threading.Lock()
+_rate_events = {}
+
+
+def client_ip():
+    return request.remote_addr or 'unknown'
+
+
+def rate_limit_exceeded():
+    """Sliding-window request limiter, keyed by client IP."""
+    ip = client_ip()
+    now = time.time()
+    with _rate_lock:
+        recent = [t for t in _rate_events.get(ip, []) if now - t < RATE_LIMIT_WINDOW_SECONDS]
+        if len(recent) >= RATE_LIMIT_REQUESTS:
+            _rate_events[ip] = recent
+            return True
+        recent.append(now)
+        _rate_events[ip] = recent
+    return False
+
+
+def validate_public_url(raw_url):
+    """Accept only plain public HTTP(S) URLs.
+
+    Closes the SSRF hole: non-HTTP schemes (file://, gopher:// ...), loopback,
+    link-local, private ranges and cloud metadata endpoints are all rejected.
+    """
+    if not raw_url or len(raw_url) > 2048:
+        return False, '链接为空或过长'
+    try:
+        parsed = urlparse(raw_url.strip())
+    except Exception:
+        return False, '链接格式不合法'
+    if parsed.scheme.lower() not in ALLOWED_URL_SCHEMES:
+        return False, '只支持 http/https 链接'
+    host = parsed.hostname
+    if not host:
+        return False, '链接缺少主机名'
+    if host.lower() in BLOCKED_HOSTNAMES:
+        return False, '不允许访问本机地址'
+    try:
+        infos = socket.getaddrinfo(host, None)
+    except Exception:
+        return False, '域名无法解析'
+    for info in infos:
+        try:
+            ip = ipaddress.ip_address(info[4][0])
+        except ValueError:
+            return False, '域名解析异常'
+        if (ip.is_private or ip.is_loopback or ip.is_link_local
+                or ip.is_reserved or ip.is_multicast or ip.is_unspecified):
+            return False, '不允许访问内网地址'
+    return True, ''
+
+
+# --- Access control ---------------------------------------------------------
+@app.before_request
+def enforce_access_password():
+    if not PUBLIC_MODE:
+        return None
+    if request.endpoint in ('login', 'static'):
+        return None
+    if request.path.startswith('/static/'):
+        return None
+    if session.get('authenticated'):
+        return None
+    return redirect(url_for('login'))
+
+
+@app.route('/login', methods=['GET', 'POST'])
+def login():
+    error = None
+    if request.method == 'POST':
+        supplied = request.form.get('password', '')
+        if hmac.compare_digest(supplied, ACCESS_PASSWORD):
+            session.clear()
+            session['authenticated'] = True
+            session.permanent = True
+            return redirect(url_for('index'))
+        error = '访问密码不正确'
+    return render_template('login.html', error=error), (401 if error else 200)
+
+
+@app.route('/logout')
+def logout():
+    session.clear()
+    return redirect(url_for('login'))
 
 def get_whisper_model():
     global whisper_model
@@ -160,21 +365,38 @@ def ytdlp_extract_info(video_url, base_opts, download=False):
         raise last_error
     raise RuntimeError("yt-dlp failed before making an extraction attempt")
 
-def stream_extraction(video_url, force_whisper=False):
+def stream_extraction(video_url, force_whisper=False, scope_id=None):
     """
     Unified streaming extraction process.
     Yields events: step_update, info, complete, error
     """
-    
+
     # --- Step 0: Check Local DB ---
     video_id = extract_video_id(video_url)
     if video_id:
         existing = get_video_from_db(video_id)
         if existing and existing['transcript']:
+            record_history(scope_id, video_id)
             yield get_event('complete', transcript=existing['transcript'], from_cache=True)
-            # If summary exists, we might want to send it too, but current contract sends transcript first.
             return
 
+    # Only the real work consumes a slot, so cache hits stay instant even when
+    # the server is busy.
+    if not _transcription_slots.acquire(blocking=False):
+        yield get_event(
+            'error',
+            error=f'服务器当前任务已满（同时最多 {MAX_CONCURRENT_TRANSCRIPTIONS} 个），请稍后重试'
+        )
+        return
+
+    try:
+        for event in _extract_uncapped(video_url, force_whisper, scope_id):
+            yield event
+    finally:
+        _transcription_slots.release()
+
+
+def _extract_uncapped(video_url, force_whisper=False, scope_id=None):
     # --- Step 1: YouTube API (Fast Path) ---
     if not force_whisper and is_youtube_url(video_url):
         yield get_event('step_update', step='api', message='Checking YouTube Transcript API...')
@@ -186,7 +408,7 @@ def stream_extraction(video_url, force_whisper=False):
                 transcript_data = fetch_youtube_transcript_with_timeout(video_id)
                 full_transcript = ' '.join([snippet.text for snippet in transcript_data.snippets])
                 if video_id:
-                   save_video_to_db(video_id, video_url, full_transcript)
+                   save_video_to_db(video_id, video_url, full_transcript, scope_id=scope_id)
                 yield get_event('complete', transcript=full_transcript)
                 return
             except Exception as e:
@@ -236,7 +458,7 @@ def stream_extraction(video_url, force_whisper=False):
                                     transcript_parts.append(seg['utf8'])
                     full_transcript = ' '.join(transcript_parts).replace('\n', ' ')
                     if video_id:
-                         save_video_to_db(video_id, video_url, full_transcript)
+                         save_video_to_db(video_id, video_url, full_transcript, scope_id=scope_id)
                     yield get_event('complete', transcript=full_transcript)
                     return
         except Exception as e:
@@ -249,7 +471,7 @@ def stream_extraction(video_url, force_whisper=False):
     # Reuse existing Whisper logic but yield events designed for the visualizer
     try:
         # We process the existing stream_whisper_transcription generator
-        for event in stream_whisper_transcription(video_url):
+        for event in stream_whisper_transcription(video_url, scope_id):
             # Parse the event to unify message format if needed, or just pass through
             # The existing event format is: data: {"status": "...", ...}
             # We want to make sure the frontend can handle it.
@@ -270,21 +492,37 @@ def index():
 
 @app.route('/extract', methods=['POST'])
 def extract():
-    data = request.get_json()
-    video_url = data.get('url', '')
-    force_whisper = data.get('force_whisper', False)
-    
+    if rate_limit_exceeded():
+        return jsonify({
+            'success': False,
+            'error': f'请求过于频繁，请稍后再试（限额 {RATE_LIMIT_REQUESTS} 次 / {RATE_LIMIT_WINDOW_SECONDS} 秒）'
+        }), 429
+
+    data = request.get_json(silent=True) or {}
+    video_url = (data.get('url') or '').strip()
+    force_whisper = bool(data.get('force_whisper', False))
+
     if not video_url:
         return jsonify({'success': False, 'error': 'No URL provided'})
-    
+
+    ok, reason = validate_public_url(video_url)
+    if not ok:
+        return jsonify({'success': False, 'error': reason})
+
+    scope_id = get_scope_id()
+
     # Always stream
-    return Response(
-        stream_with_context(stream_extraction(video_url, force_whisper)),
+    response = Response(
+        stream_with_context(stream_extraction(video_url, force_whisper, scope_id)),
         mimetype='text/event-stream'
     )
+    # Keep tunnels and reverse proxies from buffering the stream.
+    response.headers['X-Accel-Buffering'] = 'no'
+    response.headers['Cache-Control'] = 'no-cache'
+    return response
 
 
-def stream_whisper_transcription(video_url):
+def stream_whisper_transcription(video_url, scope_id=None):
     """Stream Whisper transcription progress with detailed logs"""
     try:
         yield f"data: {json.dumps({'status': 'downloading', 'message': 'Step 1/4: Fetching video information...'})}\n\n"
@@ -341,7 +579,7 @@ def stream_whisper_transcription(video_url):
             # Save to DB
             v_id = extract_video_id(video_url)
             if v_id:
-                save_video_to_db(v_id, video_url, result['text'])
+                save_video_to_db(v_id, video_url, result['text'], scope_id=scope_id)
             
     except Exception as e:
         yield f"data: {json.dumps({'status': 'error', 'error': str(e)})}\n\n"
